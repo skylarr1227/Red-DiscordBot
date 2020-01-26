@@ -1,475 +1,201 @@
-import logging
-from typing import Tuple
-
+import asyncio
+import random
+import re
+import string
+import urllib.parse
 import discord
+import requests
+#import config
+import datetime
+import json
+import os
+import urllib
+import pytz
+import io
+import aiohttp
+import async_timeout
 
-from redbot.core import Config, checks, commands
-from redbot.core.i18n import Translator, cog_i18n
-from redbot.core.utils.chat_formatting import box
-from .announcer import Announcer
-from .converters import SelfRole
+from typing import Union, Optional
+from disputils import BotEmbedPaginator, BotConfirmation, BotMultipleChoice
+from redbot.core.config import Config
+from redbot.core import commands, checks
+#from discord.ext import commands
+from .tools import remove_html, resolve_emoji
 
-log = logging.getLogger("red.admin")
-
-T_ = Translator("Admin", __file__)
-
-_ = lambda s: s
-GENERIC_FORBIDDEN = _(
-    "I attempted to do something that Discord denied me permissions for."
-    " Your command failed to successfully complete."
-)
-
-HIERARCHY_ISSUE_ADD = _(
-    "I can not give {role.name} to {member.display_name}"
-    " because that role is higher than or equal to my highest role"
-    " in the Discord hierarchy."
-)
-
-HIERARCHY_ISSUE_REMOVE = _(
-    "I can not remove {role.name} from {member.display_name}"
-    " because that role is higher than or equal to my highest role"
-    " in the Discord hierarchy."
-)
-
-ROLE_HIERARCHY_ISSUE = _(
-    "I can not edit {role.name}"
-    " because that role is higher than my or equal to highest role"
-    " in the Discord hierarchy."
-)
-
-USER_HIERARCHY_ISSUE_ADD = _(
-    "I can not let you give {role.name} to {member.display_name}"
-    " because that role is higher than or equal to your highest role"
-    " in the Discord hierarchy."
-)
-
-USER_HIERARCHY_ISSUE_REMOVE = _(
-    "I can not let you remove {role.name} from {member.display_name}"
-    " because that role is higher than or equal to your highest role"
-    " in the Discord hierarchy."
-)
-
-ROLE_USER_HIERARCHY_ISSUE = _(
-    "I can not let you edit {role.name}"
-    " because that role is higher than or equal to your highest role"
-    " in the Discord hierarchy."
-)
-
-NEED_MANAGE_ROLES = _("I need manage roles permission to do that.")
-
-RUNNING_ANNOUNCEMENT = _(
-    "I am already announcing something. If you would like to make a"
-    " different announcement please use `{prefix}announce cancel`"
-    " first."
-)
-_ = T_
+bot = commands.Bot
+BaseCog = getattr(commands, "Cog", object)
+Embed = discord.Embed
 
 
-@cog_i18n(_)
-class Admin(commands.Cog):
-    """A collection of server administration utilities."""
+class Skyutils(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
 
-    def __init__(self):
-        self.conf = Config.get_conf(self, 8237492837454039, force_registration=True)
 
-        self.conf.register_global(serverlocked=False)
 
-        self.conf.register_guild(
-            announce_ignore=False,
-            announce_channel=None,  # Integer ID
-            selfroles=[],  # List of integer ID's
-        )
-
-        self.__current_announcer = None
-
-    def cog_unload(self):
-        try:
-            self.__current_announcer.cancel()
-        except AttributeError:
-            pass
-
-    def is_announcing(self) -> bool:
+    @commands.command(pass_context=True)
+    @commands.is_owner()
+    async def orole(ctx, role: discord.Role = None, user: discord.Member = None):
         """
-        Is the bot currently announcing something?
-        :return:
+        Usage: +role Admin`. Can take roles with spaces.
+        role: Anything after "role"; should be the role name.
+        user: Any user
         """
-        if self.__current_announcer is None:
-            return False
+#        if user_is_mod(ctx.message.author) or user_is_admin(ctx.message.author) or user_is_custom_role(
+#            ctx.message.author):
+        if role is None and user is None:
+            return await ctx.send("You haven't specified a role or a user! ")
 
-        return self.__current_announcer.active or False
+        if role not in ctx.message.server.roles or user not in ctx.message.server.members:
+            return await ctx.send("That role or user doesn't exist.")
 
-    @staticmethod
-    def pass_hierarchy_check(ctx: commands.Context, role: discord.Role) -> bool:
-        """
-        Determines if the bot has a higher role than the given one.
-        :param ctx:
-        :param role: Role object.
-        :return:
-        """
-        return ctx.guild.me.top_role > role
+        if role not in ctx.message.author.roles and user == None:
+            await client.add_roles(ctx.message.author, role)
+            return await ctx.send("{} role has been added to {}."
+                            .format(role, ctx.message.author.mention))
 
-    @staticmethod
-    def pass_user_hierarchy_check(ctx: commands.Context, role: discord.Role) -> bool:
-        """
-        Determines if a user is allowed to add/remove/edit the given role.
-        :param ctx:
-        :param role:
-        :return:
-        """
-        return ctx.author.top_role > role or ctx.author == ctx.guild.owner
+        if role in ctx.message.author.roles and user == None:
+            await client.remove_roles(ctx.message.author, role)
+            return await ctx.send("{} role has been removed from {}."
+                                    .format(role, ctx.message.author.mention))
+        if  user != None and role not in user.roles:
+            await client.add_roles(user, role)
+            return await ctx.send("{} role has been added to {}.".format(role, user.mention))
 
-    async def _addrole(
-        self, ctx: commands.Context, member: discord.Member, role: discord.Role, *, check_user=True
-    ):
-        if role in member.roles:
-            await ctx.send(
-                _("{member.display_name} already has the role {role.name}.").format(
-                    role=role, member=member
-                )
-            )
-            return
-        if check_user and not self.pass_user_hierarchy_check(ctx, role):
-            await ctx.send(_(USER_HIERARCHY_ISSUE_ADD).format(role=role, member=member))
-            return
-        if not self.pass_hierarchy_check(ctx, role):
-            await ctx.send(_(HIERARCHY_ISSUE_ADD).format(role=role, member=member))
-            return
-        if not ctx.guild.me.guild_permissions.manage_roles:
-            await ctx.send(_(NEED_MANAGE_ROLES))
-            return
-        try:
-            await member.add_roles(role)
-        except discord.Forbidden:
-            await ctx.send(_(GENERIC_FORBIDDEN))
-        else:
-            await ctx.send(
-                _("I successfully added {role.name} to {member.display_name}").format(
-                    role=role, member=member
-                )
-            )
+        if  user != None and role in user.roles:
+            await client.remove_roles(user, role)
+            return await ctx.send("{} role has been removed from {}."
+                                    .format(role, user.mention))
+        #else:
+    #   return await ctx.send("Silly human, you do not have permission to use this command!")
 
-    async def _removerole(
-        self, ctx: commands.Context, member: discord.Member, role: discord.Role, *, check_user=True
-    ):
-        if role not in member.roles:
-            await ctx.send(
-                _("{member.display_name} does not have the role {role.name}.").format(
-                    role=role, member=member
-                )
-            )
-            return
-        if check_user and not self.pass_user_hierarchy_check(ctx, role):
-            await ctx.send(_(USER_HIERARCHY_ISSUE_REMOVE).format(role=role, member=member))
-            return
-        if not self.pass_hierarchy_check(ctx, role):
-            await ctx.send(_(HIERARCHY_ISSUE_REMOVE).format(role=role, member=member))
-            return
-        if not ctx.guild.me.guild_permissions.manage_roles:
-            await ctx.send(_(NEED_MANAGE_ROLES))
-            return
-        try:
-            await member.remove_roles(role)
-        except discord.Forbidden:
-            await ctx.send(_(GENERIC_FORBIDDEN))
-        else:
-            await ctx.send(
-                _("I successfully removed {role.name} from {member.display_name}").format(
-                    role=role, member=member
-                )
-            )
+
 
     @commands.command()
-    @commands.guild_only()
-    @checks.admin_or_permissions(manage_roles=True)
-    async def addrole(
-        self, ctx: commands.Context, rolename: discord.Role, *, user: discord.Member = None
-    ):
-        """
-        Add a role to a user.
+    async def fuckchoices(self, ctx):
+        multiple_choice = BotMultipleChoice(ctx, ['one', 'two', 'three', 'four', 'five', 'six'], "How many babys would you eat")
+        await multiple_choice.run()
 
-        Use double quotes if the role contains spaces.
-        If user is left blank it defaults to the author of the command.
-        """
-        if user is None:
-            user = ctx.author
-        await self._addrole(ctx, user, rolename)
+        await multiple_choice.quit(multiple_choice.choice)
+
+
 
     @commands.command()
-    @commands.guild_only()
-    @checks.admin_or_permissions(manage_roles=True)
-    async def removerole(
-        self, ctx: commands.Context, rolename: discord.Role, *, user: discord.Member = None
-    ):
-        """
-        Remove a role from a user.
+    async def testconfirm(self, ctx):
+        confirmation = BotConfirmation(ctx, 0x012345)
+        await confirmation.confirm("Do you have any event ideas that you would like to contribute?")
 
-        Use double quotes if the role contains spaces.
-        If user is left blank it defaults to the author of the command.
-        """
-        if user is None:
-            user = ctx.author
-        await self._removerole(ctx, user, rolename)
-
-    @commands.group()
-    @commands.guild_only()
-    @checks.admin_or_permissions(manage_roles=True)
-    async def editrole(self, ctx: commands.Context):
-        """Edit role settings."""
-        pass
-
-    @editrole.command(name="colour", aliases=["color"])
-    async def editrole_colour(
-        self, ctx: commands.Context, role: discord.Role, value: discord.Colour
-    ):
-        """
-        Edit a role's colour.
-
-        Use double quotes if the role contains spaces.
-        Colour must be in hexadecimal format.
-        [Online colour picker](http://www.w3schools.com/colors/colors_picker.asp)
-
-        Examples:
-            `[p]editrole colour "The Transistor" #ff0000`
-            `[p]editrole colour Test #ff9900`
-        """
-        author = ctx.author
-        reason = "{}({}) changed the colour of role '{}'".format(author.name, author.id, role.name)
-
-        if not self.pass_user_hierarchy_check(ctx, role):
-            await ctx.send(_(ROLE_USER_HIERARCHY_ISSUE).format(role=role))
-            return
-        if not self.pass_hierarchy_check(ctx, role):
-            await ctx.send(_(ROLE_HIERARCHY_ISSUE).format(role=role))
-            return
-        if not ctx.guild.me.guild_permissions.manage_roles:
-            await ctx.send(_(NEED_MANAGE_ROLES))
-            return
-        try:
-            await role.edit(reason=reason, color=value)
-        except discord.Forbidden:
-            await ctx.send(_(GENERIC_FORBIDDEN))
+        if confirmation.confirmed:
+            await confirmation.update("Yes", color=0x55ff55)
         else:
-            log.info(reason)
-            await ctx.send(_("Done."))
+            await confirmation.update("No", hide_author=True, color=0xff5555)
 
-    @editrole.command(name="name")
-    async def edit_role_name(self, ctx: commands.Context, role: discord.Role, name: str):
-        """
-        Edit a role's name.
 
-        Use double quotes if the role or the name contain spaces.
+# @commands.command()        
+# async def helpadv(self, ctx):
+#      """Quick reference for Adventure...bitches """
+    #   embeds = [
+    #       Embed(title="Quick Reference for Skybot", description="__**+adventure**__\nStart an adventure in your current channel\n__**+stats**__\nTo view your character sheet as well as\nyour currently equipped items.\n", color=0x115599),
+    #        Embed(title="Quick Reference cont. Loot", description="__**+loot**__\nUse to open your lootboxes\nJust specify the type\nExample:\n```+loot normal```\nor\n```+loot epic 10```\nfor multiple at once\n\n__**+combine**__\nCombiine your loot boxes by specifying type you wish to convert", color=0x5599ff),
+#     ]
 
-        Example:
-            `[p]editrole name \"The Transistor\" Test`
-        """
-        author = ctx.message.author
-        old_name = role.name
-        reason = "{}({}) changed the name of role '{}' to '{}'".format(
-            author.name, author.id, old_name, name
-        )
+#     paginator = BotEmbedPaginator(ctx, embeds)
+#       await paginator.run()
 
-        if not self.pass_user_hierarchy_check(ctx, role):
-            await ctx.send(_(ROLE_USER_HIERARCHY_ISSUE).format(role=role))
-            return
-        if not self.pass_hierarchy_check(ctx, role):
-            await ctx.send(_(ROLE_HIERARCHY_ISSUE).format(role=role))
-            return
-        if not ctx.guild.me.guild_permissions.manage_roles:
-            await ctx.send(_(NEED_MANAGE_ROLES))
-            return
-        try:
-            await role.edit(reason=reason, name=name)
-        except discord.Forbidden:
-            await ctx.send(_(GENERIC_FORBIDDEN))
-        else:
-            log.info(reason)
-            await ctx.send(_("Done."))
 
-    @commands.group(invoke_without_command=True)
-    @checks.is_owner()
-    async def announce(self, ctx: commands.Context, *, message: str):
-        """Announce a message to all servers the bot is in."""
-        if not self.is_announcing():
-            announcer = Announcer(ctx, message, config=self.conf)
-            announcer.start()
-
-            self.__current_announcer = announcer
-
-            await ctx.send(_("The announcement has begun."))
-        else:
-            prefix = ctx.prefix
-            await ctx.send(_(RUNNING_ANNOUNCEMENT).format(prefix=prefix))
-
-    @announce.command(name="cancel")
-    async def announce_cancel(self, ctx):
-        """Cancel a running announce."""
-        if not self.is_announcing():
-            await ctx.send(_("There is no currently running announcement."))
-            return
-        self.__current_announcer.cancel()
-        await ctx.send(_("The current announcement has been cancelled."))
-
-    @commands.group()
-    @commands.guild_only()
-    @checks.guildowner_or_permissions(administrator=True)
-    async def announceset(self, ctx):
-        """Change how announcements are sent in this guild."""
-        pass
-
-    @announceset.command(name="channel")
-    async def announceset_channel(self, ctx, *, channel: discord.TextChannel = None):
-        """
-        Change the channel where the bot will send announcements.
         
-        If channel is left blank it defaults to the current channel.
-        """
-        if channel is None:
-            channel = ctx.channel
-        await self.conf.guild(ctx.guild).announce_channel.set(channel.id)
-        await ctx.send(
-            _("The announcement channel has been set to {channel.mention}").format(channel=channel)
-        )
-
-    @announceset.command(name="ignore")
-    async def announceset_ignore(self, ctx):
-        """Toggle announcements being enabled this server."""
-        ignored = await self.conf.guild(ctx.guild).announce_ignore()
-        await self.conf.guild(ctx.guild).announce_ignore.set(not ignored)
-        if ignored:
-            await ctx.send(
-                _("The server {guild.name} will receive announcements.").format(guild=ctx.guild)
-            )
-        else:
-            await ctx.send(
-                _("The server {guild.name} will not receive announcements.").format(
-                    guild=ctx.guild
-                )
-            )
-
-    async def _valid_selfroles(self, guild: discord.Guild) -> Tuple[discord.Role]:
-        """
-        Returns a tuple of valid selfroles
-        :param guild:
-        :return:
-        """
-        selfrole_ids = set(await self.conf.guild(guild).selfroles())
-        guild_roles = guild.roles
-
-        valid_roles = tuple(r for r in guild_roles if r.id in selfrole_ids)
-        valid_role_ids = set(r.id for r in valid_roles)
-
-        if selfrole_ids != valid_role_ids:
-            await self.conf.guild(guild).selfroles.set(list(valid_role_ids))
-
-        # noinspection PyTypeChecker
-        return valid_roles
-
-    @commands.guild_only()
-    @commands.group()
-    async def selfrole(self, ctx: commands.Context):
-        """Apply selfroles."""
-        pass
-
-    @selfrole.command(name="add")
-    async def selfrole_add(self, ctx: commands.Context, *, selfrole: SelfRole):
-        """
-        Add a selfrole to yourself.
-
-        Server admins must have configured the role as user settable.
-        NOTE: The role is case sensitive!
-        """
-        # noinspection PyTypeChecker
-        await self._addrole(ctx, ctx.author, selfrole, check_user=False)
-
-    @selfrole.command(name="remove")
-    async def selfrole_remove(self, ctx: commands.Context, *, selfrole: SelfRole):
-        """
-        Remove a selfrole from yourself.
-
-        Server admins must have configured the role as user settable.
-        NOTE: The role is case sensitive!
-        """
-        # noinspection PyTypeChecker
-        await self._removerole(ctx, ctx.author, selfrole, check_user=False)
-
-    @selfrole.command(name="list")
-    async def selfrole_list(self, ctx: commands.Context):
-        """
-        Lists all available selfroles.
-        """
-        selfroles = await self._valid_selfroles(ctx.guild)
-        fmt_selfroles = "\n".join(["+ " + r.name for r in selfroles])
-
-        if not fmt_selfroles:
-            await ctx.send("There are currently no selfroles.")
-            return
-
-        msg = _("Available Selfroles:\n{selfroles}").format(selfroles=fmt_selfroles)
-        await ctx.send(box(msg, "diff"))
-
-    @commands.group()
-    @checks.admin_or_permissions(manage_roles=True)
-    async def selfroleset(self, ctx: commands.Context):
-        """Manage selfroles."""
-        pass
-
-    @selfroleset.command(name="add")
-    async def selfroleset_add(self, ctx: commands.Context, *, role: discord.Role):
-        """
-        Add a role to the list of available selfroles.
-
-        NOTE: The role is case sensitive!
-        """
-        if not self.pass_user_hierarchy_check(ctx, role):
-            await ctx.send(
-                _(
-                    "I cannot let you add {role.name} as a selfrole because that role is higher than or equal to your highest role in the Discord hierarchy."
-                ).format(role=role)
-            )
-            return
-        async with self.conf.guild(ctx.guild).selfroles() as curr_selfroles:
-            if role.id not in curr_selfroles:
-                curr_selfroles.append(role.id)
-                await ctx.send(_("Added."))
-                return
-
-        await ctx.send(_("That role is already a selfrole."))
-
-    @selfroleset.command(name="remove")
-    async def selfroleset_remove(self, ctx: commands.Context, *, role: SelfRole):
-        """
-        Remove a role from the list of available selfroles.
-
-        NOTE: The role is case sensitive!
-        """
-        if not self.pass_user_hierarchy_check(ctx, role):
-            await ctx.send(
-                _(
-                    "I cannot let you remove {role.name} from being a selfrole because that role is higher than or equal to your highest role in the Discord hierarchy."
-                ).format(role=role)
-            )
-            return
-        async with self.conf.guild(ctx.guild).selfroles() as curr_selfroles:
-            curr_selfroles.remove(role.id)
-
-        await ctx.send(_("Removed."))
 
     @commands.command()
-    @checks.is_owner()
-    async def serverlock(self, ctx: commands.Context):
-        """Lock a bot to its current servers only."""
-        serverlocked = await self.conf.serverlocked()
-        await self.conf.serverlocked.set(not serverlocked)
+    async def pfp(self, ctx, *, member: discord.Member = None):
+        """Displays a user's avatar."""
+        if member is None:
+            member = ctx.author
+        embed = discord.Embed(color=discord.Color.blue(),
+                            description=f"[Link to Avatar]({member.avatar_url_as(static_format='png')})")
+        embed.set_author(name=f"{member.name}\'s Avatar")
+        embed.set_image(url=member.avatar_url)
+        await ctx.send(embed=embed)
+        
 
-        if serverlocked:
-            await ctx.send(_("The bot is no longer serverlocked."))
-        else:
-            await ctx.send(_("The bot is now serverlocked."))
+#  @commands.command()
+#  async def nick(self, ctx, *, nick: str):
+#      """Set your nickname.
+#     Usage: nick [new nickname]"""
+# 3  #     if ctx.author.guild_permissions.change_nickname:
+#          await ctx.author.edit(nick=nick, reason='User requested using command')
+#            await ctx.send(':thumbsup: Done.')
+#        else:
+#           await ctx.send(':x: You don\'t have permission to change your nickname.')      
+            
+            
 
-    # region Event Handlers
-    async def on_guild_join(self, guild: discord.Guild):
-        if await self.conf.serverlocked():
-            await guild.leave()
+            
+    @commands.Cog.listener()
+    async def on_message(self,message):
+        mathshit=['+','-','*','/','^']
+        msg=message.content
+        msgshit=msg.split(' ')
+        for a in msgshit:
+            if a in mathshit:
+                if a=='+':
+                    await message.channel.send(str(int(msgshit[0])+int(msgshit[2])))
+                elif a=='-':
+                    await message.channel.send(str(int(msgshit[0])-int(msgshit[2])))
+                elif a=='*':
+                    await message.channel.send(str(int(msgshit[0])*int(msgshit[2])))
+                elif a=='/':
+                    await message.channel.send(str(int(msgshit[0])/int(msgshit[2])))
+                elif a =='^':
+                    await message.channel.send(str(int(msgshit[0])**int(msgshit[2])))
+                else:
+                    print('whatever')
 
+    
+    @checks.has_permissions(manage_messages=True)
+    @commands.bot_has_permissions(embed_links=True)
+    @commands.command()
+    async def eventmsg(self, ctx, color:Optional[discord.Color]=None, *, text):
+        """
+        Send an embed for a special event
 
-# endregion
+        Use the optional parameter color to change the color of the embed.
+        The embed will contain the text text.
+        All normal discord formatting will work inside the embed. 
+        """
+        emoji = discord.utils.get(self.bot.emojis, id=610290433725169703)
+        if color is None:
+            color = await ctx.embed_color()
+        embed = discord.Embed(description=text, color=color)
+        embed.set_footer(text="Be the first to Click the Firework reaction!!!", icon_url="https://cdn.discordapp.com/emojis/604916559709995008.gif")
+        embed.set_author(name="Happy New Years!!!!", icon_url="https://cdn.discordapp.com/emojis/610290337734197252.gif")
+        msg=await ctx.send(embed=embed)
+        def check(reaction, user):
+            if user.bot:
+                return False
+            if not (reaction.message.id == msg.id and reaction.emoji.id == emoji.id):
+                return False
+                return True
+        await msg.add_reaction(emoji)
+        reaction, user = await self.bot.wait_for('reaction_add', check=check)
+    # await ctx.channel.send (str(user))      
+        await ctx.send(f"and... <@{str(user.id)}> got it first!!! Reki wasted my hard work! WEEEE")
+    #  await ctx.delete(msg)
+            
+    #@commands.command(pass_context=True)
+    #async def memberlog(ctx):
+    #    """Returns a CSV file of all users on the server."""
+    #    await self.bot.request_offline_members(ctx.message.server)
+    #    before = time.time()
+    #    nicknames = [m.display_name for m in ctx.message.server.members]
+    #    with open('temp.csv', mode='w', encoding='utf-8', newline='') as f:
+    #        writer = csv.writer(f, dialect='excel')
+    #        for v in nicknames:
+    #            writer.writerow([v])
+    #            after = time.time()
+    #            await bot.send_file(ctx.message.author, 'temp.csv', filename='stats.csv',
+    #                                content="Sent to your dms. Generated in {:.4}ms.".format((after - before)*1000))
+    
+    
+    
+def setup(bot):
+    bot.add_cog(Skyutils(bot))
